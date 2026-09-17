@@ -14,7 +14,8 @@ def get_post(post_id):
         print("请求失败: ",error)
         return None
 
-post = get_post(1)
+post_id = input("请输入文章ID: ")
+post = get_post(post_id)
 
 if post is not None:
     print("标题：",post["title"])
