@@ -1,5 +1,8 @@
 import requests
 import json
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 def get_post(post_id):
     url = f"https://jsonplaceholder.typicode.com/posts/{post_id}"
@@ -20,7 +23,7 @@ post = get_post(post_id)
 if post is not None:
     print("标题：",post["title"])
 
-    with open("post.json","w",encoding="utf-8") as file:
+    with open(PROJECT_ROOT / "post.json","w",encoding="utf-8") as file:
         json.dump(
             post,
             file,

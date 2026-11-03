@@ -1,7 +1,10 @@
 import sqlite3
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
-connection = sqlite3.connect("papers.db")
+connection = sqlite3.connect(PROJECT_ROOT / "papers.db")
 
 cursor = connection.cursor()
 

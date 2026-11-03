@@ -1,5 +1,28 @@
-papers.json
+# Python
 __pycache__/
-.env
+*.py[cod]
+
+# Virtual environments
 .venv/
-papers.db
+venv/
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Local database
+*.db
+*.sqlite3
+
+# Tests
+.pytest_cache/
+
+# Local PDF documents
+data/*.pdf
+# Local application data and generated artifacts
+data/
+/papers.json
+/post.json
+*.db-*
+*.sqlite3-*
