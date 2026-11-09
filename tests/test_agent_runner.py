@@ -1,119 +1,48 @@
 import json
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock
 
+import agent_tools
 from agent_runner import run_agent
 
 
-def test_run_agent_with_tools():
+def completion(content=None, tool_calls=None):
+    message = SimpleNamespace(content=content, tool_calls=tool_calls)
+    return SimpleNamespace(choices=[SimpleNamespace(message=message)])
 
-    # 1. 模拟第一次 DeepSeek 返回工具调用请求
-    fake_tool_call = SimpleNamespace(
+
+def test_run_agent_with_tool(monkeypatch):
+    source = {"page": 2, "chunk_id": 4, "score": 0.8, "preview": "示例证据"}
+    retrieve = Mock(return_value=("示例论文片段", [source]))
+    monkeypatch.setattr(agent_tools, "retrieve_context_with_sources", retrieve)
+    tool_call = SimpleNamespace(
         id="call_123",
-        function=SimpleNamespace(
-            name="search_paper",
-            arguments='{"query": "葡萄糖检测限"}'
-        )
+        function=SimpleNamespace(name="search_paper", arguments='{"query":" limit "}'),
     )
-
-    fake_message = SimpleNamespace(
-        content=None,
-        tool_calls=[fake_tool_call]
-    )
-
-    # 2. 模拟工具执行结果
-    fake_tool_messages = [
-        {
-            "role": "tool",
-            "tool_call_id": "call_123",
-            "content": json.dumps(
-                {
-                    "context": "葡萄糖检测限为 0.4631 μM",
-                    "sources": [
-                        {
-                            "page": 6,
-                            "chunk_id": 66,
-                            "score": 0.80,
-                            "preview": "葡萄糖检测限为 0.4631 μM"
-                        }
-                    ]
-                },
-                ensure_ascii=False
-            )
-        }
-    ]
-
-    # 3. 模拟第二次 DeepSeek 回答
     client = Mock()
+    create = client.chat.completions.create
+    create.side_effect = [completion(tool_calls=[tool_call]), completion("示例回答")]
 
-    client.chat.completions.create.return_value = (
-        SimpleNamespace(
-            choices=[
-                SimpleNamespace(
-                    message=SimpleNamespace(
-                        content="论文中葡萄糖检测限为 0.4631 μM"
-                    )
-                )
-            ]
-        )
-    )
+    chunks, model, embeddings = [], object(), []
+    result = run_agent("检测限是多少？", client, chunks, model, embeddings)
 
-    # 4. 执行 Agent 主流程
-    with patch(
-        "agent_runner.request_tool_decision",
-        return_value=fake_message
-    ), patch(
-        "agent_runner.execute_tool_calls",
-        return_value=fake_tool_messages
-    ) as mock_execute:
+    assert result == {"answer": "示例回答", "sources": [source]}
+    retrieve.assert_called_once_with("limit", chunks, model, embeddings, k=10)
+    first, followup = [request.kwargs for request in create.call_args_list]
+    assert first["tools"] == [agent_tools.PAPER_SEARCH_TOOL]
+    messages = followup["messages"]
+    assert [message["role"] for message in messages] == ["system", "user", "assistant", "tool"]
+    assert messages[2]["tool_calls"][0]["id"] == messages[3]["tool_call_id"] == "call_123"
+    assert json.loads(messages[3]["content"]) == {"context": "示例论文片段", "sources": [source]}
 
-        result = run_agent(
-            "葡萄糖检测限是多少？",
-            client,
-            None,
-            None,
-            None
-        )
 
-    # 5. 检查最终回答
-    assert result["answer"] == (
-        "论文中葡萄糖检测限为 0.4631 μM"
-    )
+def test_run_agent_direct_answer(monkeypatch):
+    retrieve = Mock()
+    monkeypatch.setattr(agent_tools, "retrieve_context_with_sources", retrieve)
+    client = Mock()
+    create = client.chat.completions.create
+    create.return_value = completion("你好")
 
-    # 6. 检查 sources 已成功整合
-    assert len(result["sources"]) == 1
-    assert result["sources"][0]["page"] == 6
-    assert result["sources"][0]["chunk_id"] == 66
-    assert result["sources"][0]["score"] == 0.80
-
-    # 7. 检查工具执行
-    mock_execute.assert_called_once()
-
-    # 8. 检查第二次 DeepSeek 请求
-    client.chat.completions.create.assert_called_once()
-
-    kwargs = client.chat.completions.create.call_args.kwargs
-    assert kwargs["model"] == "deepseek-flash"
-
-    # 9. 检查消息顺序
-    messages = kwargs["messages"]
-
-    assert len(messages) == 4
-    assert [m["role"] for m in messages] == [
-        "system",
-        "user",
-        "assistant",
-        "tool"
-    ]
-
-    # 10. 检查工具调用 ID
-    assert messages[2]["tool_calls"][0]["id"] == "call_123"
-    assert messages[3]["tool_call_id"] == "call_123"
-
-    # 11. 检查工具证据已发送给 DeepSeek
-    tool_data = json.loads(messages[3]["content"])
-
-    assert tool_data["context"] == (
-        "葡萄糖检测限为 0.4631 μM"
-    )
-    assert tool_data["sources"][0]["page"] == 6
+    assert run_agent("你好", client, [], None, []) == {"answer": "你好", "sources": []}
+    create.assert_called_once()
+    retrieve.assert_not_called()
