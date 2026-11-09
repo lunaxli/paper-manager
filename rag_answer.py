@@ -4,6 +4,7 @@ from openai import OpenAI
 
 load_dotenv()
 
+
 def generate_answer(question, context):
     api_key = os.getenv("DEEPSEEK_API_KEY")
 
@@ -53,7 +54,5 @@ def generate_answer(question, context):
     max_tokens=800
     )
 
-    # 提取模型回答
     answer = response.choices[0].message.content
-    # 打印模型回答
     return answer

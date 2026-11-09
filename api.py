@@ -1,67 +1,78 @@
-import sqlite3
-from fastapi import FastAPI
-from pydantic import BaseModel
-from fastapi import HTTPException
-from pydantic import Field
+import logging
 import os
-from dotenv import load_dotenv
+import time
 from functools import lru_cache
-from rag_retrieval import prepare_retriever,retrieve_context_with_sources
+
+from fastapi import FastAPI, HTTPException
+from openai import APIError, OpenAI
+from pydantic import BaseModel, Field
+
+# Import RAG first so it loads .env before config reads environment variables.
 from rag_answer import generate_answer
+
+import config
 from agent_runner import run_agent
+from graph_agent import create_research_agent
+from rag_retrieval import prepare_retriever, retrieve_context_with_sources
 
-load_dotenv()
+logger = logging.getLogger(__name__)
+level = getattr(logging, config.LOG_LEVEL, None)
+if not isinstance(level, int):
+    raise ValueError("无效的日志级别")
+logger.setLevel(level)
 
-from openai import OpenAI, APIError
 
 app = FastAPI()
 
 
-class PaperCreate(BaseModel):
-    title: str = Field(min_length=1,max_length=200)
-    year: int = Field(ge=1900,le=2100)
-
-
-class PaperUpdate(BaseModel):
-    year: int = Field(ge=1900,le=2100)
-
-
-class AskRequest(BaseModel):
-    question:str = Field(min_length=1,max_length=1000)
-
 class RagAskRequest(BaseModel):
     question: str = Field(min_length=1, max_length=1000)
+
 
 class AgentAskRequest(BaseModel):
     question: str = Field(min_length=1, max_length=1000)
 
 
+class SourceInfo(BaseModel):
+    page: int
+    chunk_id: int
+    score: float
+    preview: str
+
+
+class GraphAskResponse(BaseModel):
+    answer: str
+    sources: list[SourceInfo]
+
+
 @lru_cache(maxsize=1)
 def get_retriever():
-    all_chunks,model,embeddings = prepare_retriever("data/sample.pdf")
-    return all_chunks,model,embeddings
+    return prepare_retriever("data/sample.pdf")
+
 
 @app.post("/rag/ask")
-def rag_ask(req:RagAskRequest):
-    all_chunks,model,embeddings = get_retriever()
-    context,sources = retrieve_context_with_sources(req.question,all_chunks,model,embeddings,k=10)
+def rag_ask(req: RagAskRequest):
+    all_chunks, model, embeddings = get_retriever()
+    context, sources = retrieve_context_with_sources(
+        req.question, all_chunks, model, embeddings, k=10
+    )
     try:
-        answer = generate_answer(req.question,context)
+        answer = generate_answer(req.question, context)
     except APIError:
         raise HTTPException(
             status_code=502,
             detail="AI 服务暂时不可用，请稍后再试"
         )
     return {
-        "question":req.question,
-        "answer":answer,
-        "sources":sources
+        "question": req.question,
+        "answer": answer,
+        "sources": sources
     }
+
 
 @app.post("/agent/ask")
 def agent_ask(req: AgentAskRequest):
 
-    # 第一步：先检查 API Key
     api_key = os.getenv("DEEPSEEK_API_KEY")
 
     if not api_key:
@@ -70,16 +81,13 @@ def agent_ask(req: AgentAskRequest):
             detail="缺少 DEEPSEEK_API_KEY"
         )
 
-    # 第二步：确认 API Key 存在后，再加载检索资源
     all_chunks, model, embeddings = get_retriever()
 
-    # 第三步：创建 DeepSeek 客户端
     client = OpenAI(
         api_key=api_key,
-        base_url="https://api.deepseek.com"
+        base_url=config.DEEPSEEK_BASE_URL
     )
 
-    # 第四步：运行 Agent
     try:
         result = run_agent(
             question=req.question,
@@ -96,178 +104,61 @@ def agent_ask(req: AgentAskRequest):
 
     return result
 
+
+@app.post("/graph/ask", response_model=GraphAskResponse)
+def graph_ask(request: AgentAskRequest):
+    question = request.question.strip()
+    if not question:
+        raise HTTPException(
+            status_code=422,
+            detail="问题不能为空"
+        )
+    api_key = os.getenv("DEEPSEEK_API_KEY")
+
+    if not api_key:
+        raise HTTPException(
+            status_code=500,
+            detail="DEEPSEEK_API_KEY 未配置"
+        )
+
+    all_chunks, model, embeddings = get_retriever()
+
+    client = OpenAI(
+        api_key=api_key,
+        base_url=config.DEEPSEEK_BASE_URL
+    )
+    graph = create_research_agent(client, all_chunks, model, embeddings)
+    start_time = time.perf_counter()
+    try:
+        state_result = graph.invoke({"question": question})
+    except APIError:
+        logger.error("DeepSeek API 请求失败", exc_info=True)
+        raise HTTPException(
+            status_code=502,
+            detail="DeepSeek API 请求失败"
+        )
+    finally:
+        end_time = time.perf_counter()
+        elapsed_ms = (end_time - start_time) * 1000
+        logger.info(f"LangGraph 执行耗时:{elapsed_ms:.2f} ms")
+
+    answer = state_result.get("answer")
+
+    if not isinstance(answer, str) or not answer.strip():
+        raise HTTPException(
+            status_code=500,
+            detail="Agent 未生成有效回答"
+        )
+
+    sources = state_result.get("sources", [])
+    return {
+        "answer": answer,
+        "sources": sources
+    }
+
+
 @app.get("/")
 def home():
     return {
         "message": "Hello FastAPI"
     }
-
-
-@app.get("/papers")
-def get_papers():
-
-    connection = sqlite3.connect("papers.db")
-    cursor = connection.cursor()
-
-    cursor.execute(
-        "SELECT * FROM papers"
-    )
-
-    rows = cursor.fetchall()
-
-    connection.close()
-
-    papers = []
-
-    for row in rows:
-        paper = {
-            "id": row[0],
-            "title": row[1],
-            "year": row[2]
-        }
-
-        papers.append(paper)
-
-    return papers
-
-
-@app.get("/papers/{paper_id}")
-def get_paper(paper_id: int):
-
-    connection = sqlite3.connect("papers.db")
-    cursor = connection.cursor()
-
-    cursor.execute(
-        "SELECT * FROM papers WHERE id = ?",
-        (paper_id,)
-    )
-
-    row = cursor.fetchone()
-
-    connection.close()
-
-    if row is None:
-        return {
-            "message": "没有找到论文"
-        }
-
-    return {
-        "id": row[0],
-        "title": row[1],
-        "year": row[2]
-    }
-
-
-@app.post("/papers")
-def create_paper(paper: PaperCreate):
-
-    connection = sqlite3.connect("papers.db")
-    cursor = connection.cursor()
-
-    cursor.execute(
-        "INSERT INTO papers (title, year) VALUES (?, ?)",
-        (
-            paper.title,
-            paper.year
-        )
-    )
-
-    connection.commit()
-
-    paper_id = cursor.lastrowid
-
-    connection.close()
-
-    return {
-        "id": paper_id,
-        "title": paper.title,
-        "year": paper.year
-    }
-
-
-@app.delete("/papers/{paper_id}")
-def delete_paper(paper_id:int):
-
-    connection = sqlite3.connect("papers.db")
-    cursor = connection.cursor()
-
-    cursor.execute(
-        "DELETE FROM papers WHERE id = ?",
-        (paper_id,)
-    )
-
-    connection.commit()
-
-    if cursor.rowcount > 0:
-        result = {"msg":"删除成功"}
-        connection.close()
-        return result
-
-    else:
-        connection.close()
-        raise HTTPException(status_code=404,detail="论文不存在")
-
-
-@app.put("/papers/{paper_id}")
-def update_paper(paper_id: int, paper: PaperUpdate):
-
-    connection = sqlite3.connect("papers.db")
-
-    try:
-        cursor = connection.cursor()
-
-        cursor.execute(
-            "UPDATE papers SET year = ? WHERE id = ?",
-            (paper.year, paper_id)
-        )
-
-        affected_rows = cursor.rowcount
-        connection.commit()
-
-        if affected_rows > 0:
-            return {
-                "message": "修改成功"
-            }
-        else:
-            raise HTTPException(
-                status_code=404,
-                detail="没有这个论文"
-            )
-
-    finally:
-        connection.close()
-
-
-#09-6：让 FastAPI 真正调用 DeepSeek
-#09-7｜AI 接口异常处理
-
-@app.post("/ai/ask")
-def ask(request: AskRequest):
-    api_key = os.getenv("DEEPSEEK_API_KEY")
-
-    if not api_key:
-        raise ValueError("没有找到 DEEPSEEK_API_KEY")
-
-    client = OpenAI(
-        api_key=api_key,
-        base_url="https://api.deepseek.com"
-    )
-    try:
-        response = client.chat.completions.create(
-            model="deepseek-flash",
-            messages=[
-                {
-                    "role":"user",
-                    "content":request.question
-                }
-            ]
-        )
-
-        answer = response.choices[0].message.content
-        return {"answer":answer}
-    except APIError:
-        raise HTTPException(
-            status_code=502,
-            detail="AI 服务暂时不可用，请稍后再试"
-        )
-

@@ -1,164 +1,96 @@
 # ResearchAgent
 
-基于 FastAPI、RAG 和 LLM Tool Calling 构建的科研论文智能问答系统。
+ResearchAgent 是一个用 FastAPI 提供接口的论文问答项目。它从本地 PDF 提取文本，用 FastEmbed 检索相关片段，再通过 DeepSeek 生成回答。三条问答链共享检索代码，方便对比固定 RAG、模型工具调用和 LangGraph 编排。
 
-## 项目简介
+| 方式 | 接口 | 流程 |
+| --- | --- | --- |
+| 固定 RAG | `POST /rag/ask` | 每次都检索论文片段，再调用模型回答 |
+| V1 Agent | `POST /agent/ask` | 模型决定是否调用 `search_paper`，由 Python 代码执行工具并组织后续回答 |
+| V2 LangGraph | `POST /graph/ask` | 状态图管理问题、工具调用、来源和回答，按模型决策选择分支 |
 
-ResearchAgent 是一个面向科研论文阅读场景的 AI 应用，支持从 PDF 论文中检索相关内容，并结合大语言模型生成回答。
+```mermaid
+flowchart LR
+    A[准备问题] --> B[模型决策]
+    B -->|直接回答| E[返回结果]
+    B -->|请求检索| C[执行工具并整理来源]
+    C --> D[根据证据生成回答]
+    D --> E
+```
 
-项目实现了两种问答模式：
+V1 和 V2 都支持一次决策发出多个检索调用。V2 按页码和片段 ID 去重，保留最高分并按分数降序返回。当前实现以单轮工具决策为主。
 
-- **RAG 问答**：先检索论文片段，再使用大模型生成回答。
-- **Agent 问答**：由大模型自主判断是否调用论文检索工具，并根据工具返回的信息生成最终回答。
+## 本地运行
 
-系统可以返回论文页码、文本片段 ID 和向量相似度，帮助用户定位相关论文内容。
+使用 Python 3.12 或更高版本，已在 Python 3.13.7 上验证。以下命令在 Windows PowerShell 的项目根目录运行。
 
-## 技术栈
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+python -m uvicorn api:app --reload
+```
 
-| 类别 | 技术 |
-|---|---|
-| 后端框架 | FastAPI、Pydantic |
-| 大语言模型 | DeepSeek（OpenAI 兼容接口） |
-| Agent | Function Calling / Tool Calling |
-| RAG | FastEmbed、NumPy |
-| PDF 解析 | PyMuPDF |
-| 数据库 | SQLite |
-| 自动化测试 | pytest、FastAPI TestClient、Mock |
+打开 [Swagger 接口文档](http://127.0.0.1:8000/docs) 查看接口。可以先调用 `GET /` 检查服务是否启动。启动服务和运行测试无需配置真实密钥或准备 PDF。
 
-## 核心功能
+体验问答时，把一份可提取文本的 PDF 放在 `data/sample.pdf`，在启动服务前设置环境变量。
 
-1. PDF 文本提取与分块
-2. Embedding 向量生成与相似度检索
-3. 基于论文内容的 RAG 问答
-4. 大模型自主决策的工具调用
-5. 多次工具调用及结果整合
-6. 返回检索来源信息
-7. FastAPI REST API
-8. 自动化测试与异常处理
+```powershell
+$env:DEEPSEEK_API_KEY="你的 API Key"
+```
 
-## Agent 工作流程
+三条问答链在首次调用时都会准备检索资源，FastEmbed 此时可能下载 `BAAI/bge-small-en-v1.5`。更换 PDF 后重启服务，以重新构建缓存。密钥和 PDF 应留在本地。
 
-用户问题 → DeepSeek 判断是否需要工具 → 调用 search_paper → 检索论文片段 → 返回工具结果 → DeepSeek 生成最终回答。
+| 配置 | 默认值 | 作用 |
+| --- | --- | --- |
+| `DEEPSEEK_API_KEY` | 无 | 三条问答链的模型服务凭据 |
+| `DEEPSEEK_MODEL` | `deepseek-flash` | V1 和 V2 的模型 |
+| `DEEPSEEK_BASE_URL` | `https://api.deepseek.com` | V1 和 V2 的模型地址 |
+| `DEEPSEEK_MAX_TOKENS` | `700` | V1 和 V2 的单次回答 token 上限 |
+| `LOG_LEVEL` | `INFO` | API 日志级别 |
 
-如果大模型没有发起工具调用，则直接返回模型回答。
+固定 RAG 使用代码中的模型和地址，回答上限为 800 token。
 
-当前实现以单轮工具执行为主，不包含多轮自主规划或多 Agent 协作。
+## 请求示例
+
+在 Swagger 里选择任一问答接口，提交相同的问题来对比三条链的行为。
+
+```json
+{
+  "question": "论文中如何评估方法的性能？请给出依据。"
+}
+```
+
+三个接口都返回 `answer` 和 `sources`，固定 RAG 额外返回 `question`。每条来源包含 `page`、`chunk_id`、`score` 和 `preview`。Agent 选择直接回答时，`sources` 为空。来源是检索到的候选证据，需要结合原文核对结论。
+
+## 测试
+
+```powershell
+python -m pytest -q
+```
+
+- 固定 RAG 测试在临时目录生成示例 PDF，验证解析、检索、证据拼装和接口响应。嵌入模型和 DeepSeek SDK 使用模拟对象。
+- V1 测试覆盖直接回答和工具分支，检查工具调用 ID 与证据如何传回模型。
+- V2 测试运行实际 LangGraph，检查条件路由、多工具证据、来源去重和排序。
+- API 测试覆盖请求与响应校验、模型调用失败时的 HTTP 502，以及 V2 执行日志。模型响应与异常均由测试模拟，运行测试不会产生模型调用费用。
 
 ## 项目结构
 
 ```text
-paper-manager/
-├── api.py
-├── agent_runner.py
-├── agent_tools.py
-├── pdf_parser.py
-├── rag_retrieval.py
-├── rag_answer.py
-├── main.py
-├── paper_service.py
-├── storage.py
-├── data/
+ResearchAgent/
+├── api.py                # FastAPI 路由和响应校验
+├── config.py             # Agent 模型及日志配置
+├── agent_runner.py       # V1 流程及共用工具调用逻辑
+├── agent_tools.py        # 论文检索工具定义与执行
+├── graph_agent.py        # V2 状态、节点与路由
+├── pdf_parser.py         # PDF 文本提取与分块
+├── rag_retrieval.py      # 向量化、相似度与来源
+├── rag_answer.py         # 固定 RAG 的模型调用
+├── data/                # 本地放置 sample.pdf
 ├── tests/
-├── learning/          # 独立的 Python 学习练习
-├── pytest.ini         # 仅收集自动化测试
+├── pytest.ini
 ├── requirements.txt
 ├── .gitignore
 └── README.md
 ```
 
-## 本地运行
-
-**1. 创建并激活虚拟环境**
-
-```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-```
-
-**2. 安装依赖**
-
-```powershell
-python -m pip install -r requirements.txt
-```
-
-**3. 配置 DeepSeek API Key**
-
-在 PowerShell 当前会话中设置环境变量：
-
-```powershell
-$env:DEEPSEEK_API_KEY="你的API_KEY"
-```
-
-不要把真实 API Key 提交到 GitHub。
-
-**4. 准备论文**
-
-将用于测试的 PDF 论文放到：
-
-```text
-data/sample.pdf
-```
-
-当前版本使用本地固定 PDF 文件作为知识来源。论文 PDF 不随公开仓库分发。
-
-**5. 启动服务**
-
-```powershell
-python -m uvicorn api:app --reload
-```
-
-打开 Swagger API 文档：
-
-http://127.0.0.1:8000/docs
-
-## API 示例
-
-### RAG 问答
-
-`POST /rag/ask`
-
-```json
-{
-  "question": "论文中葡萄糖的检测限是多少？"
-}
-```
-
-### Agent 问答
-
-`POST /agent/ask`
-
-```json
-{
-  "question": "根据论文实验数据，葡萄糖的检测限是多少？"
-}
-```
-
-返回内容包含 `answer` 和 `sources`，其中 `sources` 表示检索命中的候选论文片段，并非逐句验证后的引用。
-
-## 运行测试
-
-```powershell
-python -m pytest -v
-```
-
-测试覆盖 API 参数校验、RAG 流程、Agent Tool Calling、模型异常处理等功能。
-
-## 当前限制
-
-- 当前版本仅使用本地固定论文文件，尚不支持多用户上传和管理独立知识库。
-- Agent 使用自定义 Tool Calling 流程，尚未集成 LangGraph。
-- 检索来源是候选证据，尚未实现回答与证据的逐句一致性验证。
-- 当前主要面向本地运行与开发测试。
-
-## 后续规划
-
-- 使用 LangGraph 实现状态化 Agent 工作流
-- 使用 MCP 标准封装论文检索工具
-- 完善数据库持久化及部署能力
-- 增加 Agent 执行日志与效果评估
-
-## 学习练习与兼容入口
-
-独立的 HTTP、类、SQLite、Embedding 和 LLM 练习已归入 `learning/`，详见 [学习练习说明](learning/README.md)。这些脚本具有交互、写数据或联网行为，不作为 pytest 测试收集。
-
-旧 JSON 命令行入口继续使用 `python main.py`；API 服务继续使用 `python -m uvicorn api:app --reload`。请在项目根目录运行这两个入口，以沿用原有的相对数据路径。
+项目一次检索一份本地 PDF。问答状态随请求创建，来源页码从 PDF 的第一页起计数。

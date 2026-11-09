@@ -18,10 +18,10 @@ venv/
 # Tests
 .pytest_cache/
 
-# Local PDF documents
-data/*.pdf
-# Local application data and generated artifacts
-data/
+# Local PDFs and generated data
+*.pdf
+/data/*
+!/data/.gitkeep
 /papers.json
 /post.json
 *.db-*
