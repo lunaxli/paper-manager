@@ -15,6 +15,13 @@ from agent_runner import run_agent
 from graph_agent import create_research_agent
 from rag_retrieval import prepare_retriever, retrieve_context_with_sources
 
+import sys
+from pathlib import Path
+
+from mcp import Client, StdioServerParameters
+from graph_agent import create_mcp_research_agent
+from mcp import MCPError
+
 logger = logging.getLogger(__name__)
 level = getattr(logging, config.LOG_LEVEL, None)
 if not isinstance(level, int):
@@ -156,6 +163,82 @@ def graph_ask(request: AgentAskRequest):
         "sources": sources
     }
 
+
+@app.post("/graph-mcp/ask", response_model=GraphAskResponse)
+async def graph_mcp_ask(request: AgentAskRequest):
+
+    question = request.question.strip()
+
+    if not question:
+        raise HTTPException(
+            status_code=422,
+            detail="问题不能为空"
+        )
+
+    api_key = os.getenv("DEEPSEEK_API_KEY")
+
+    if not api_key:
+        raise HTTPException(
+            status_code=500,
+            detail="缺少 DEEPSEEK_API_KEY"
+        )
+
+    llm_client = OpenAI(
+        api_key=api_key,
+        base_url=config.DEEPSEEK_BASE_URL
+    )
+
+    base_dir = Path(__file__).resolve().parent
+
+    server = StdioServerParameters(
+        command=sys.executable,
+        args=[str(base_dir / "mcp_server.py")],
+        cwd=str(base_dir)
+    )
+
+    try:
+        async with Client(server) as mcp_client:
+            graph = create_mcp_research_agent(
+                llm_client,
+                mcp_client
+            )
+
+            state_result = await graph.ainvoke(
+                {"question": question}
+            )
+    except* APIError:
+        logger.error(
+            "DeepSeek API 请求失败",
+            exc_info=True
+        )
+        raise HTTPException(
+            status_code=502,
+            detail="DeepSeek API 请求失败"
+        )
+
+    except* (MCPError, OSError, RuntimeError):
+        logger.error(
+            "MCP 服务调用失败",
+            exc_info=True
+        )
+        raise HTTPException(
+            status_code=502,
+            detail="MCP 服务调用失败"
+        )
+
+        
+    answer = state_result.get("answer", None)
+    if not (isinstance(answer, str) and answer.strip()):
+        raise HTTPException(
+            status_code=500,
+            detail="Agent 未返回有效回答"
+        )
+    sources = state_result.get("sources", [])
+
+    return {
+        "answer": answer,
+        "sources": sources
+    }
 
 @app.get("/")
 def home():
