@@ -6,6 +6,7 @@ pydantic==2.13.5
 # LLM / DeepSeek and Agent workflow
 openai==3.35.1
 langgraph==1.2.19
+mcp==2.3.0
 
 # RAG / PDF
 pymupdf==2.0

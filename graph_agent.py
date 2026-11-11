@@ -11,6 +11,8 @@ from agent_runner import (
     request_tool_decision,
 )
 
+from mcp_client import call_search_paper
+
 V2_SEARCH_PROMPT = (
     "你是一名科研论文分析助手。"
     "涉及论文内容、实验数据或研究结论时，"
@@ -97,6 +99,67 @@ def make_tool_node(all_chunks, model, embeddings):
     return execute_tools
 
 
+def make_mcp_tool_node(mcp_client):
+
+    async def mcp_tool_node(state: ResearchState):
+
+        tool_calls = state.get("tool_calls", [])
+
+        tool_messages = []
+        sources_by_key = {}
+
+        for call in tool_calls:
+
+            arguments = call["arguments"]
+            if isinstance(arguments,str):
+                arguments = json.loads(arguments)
+            query = arguments["query"]
+            tool_call_id = call["id"]
+
+            data = await call_search_paper(
+                mcp_client,
+                query
+            )
+
+            tool_message = {
+                "role": "tool",
+                "tool_call_id": tool_call_id,
+                "content": json.dumps(
+                    data,
+                    ensure_ascii=False
+                )
+            }
+            tool_messages.append(tool_message)
+            
+            for source in data["sources"]:
+
+                key = (
+                    source["page"],
+                    source["chunk_id"]
+                )
+
+                old_source = sources_by_key.get(key)
+
+                if (
+                    old_source is None
+                    or source["score"] > old_source["score"]
+                ):
+                    sources_by_key[key] = source
+
+        sources = sorted(
+            sources_by_key.values(),
+            key=lambda source: source["score"],
+            reverse=True
+        )
+
+        return {
+            "tool_messages": tool_messages,
+            "sources": sources
+        }
+
+    return mcp_tool_node
+
+
 def make_final_answer_node(client):
 
     def generate_final_answer(state: ResearchState):
@@ -165,4 +228,26 @@ def create_research_agent(client, all_chunks, model, embeddings):
     )
     builder.add_edge("execute_tools", "generate_final_answer")
     builder.add_edge("generate_final_answer", END)
+    return builder.compile()
+
+
+def create_mcp_research_agent(client, mcp_client):
+    builder = StateGraph(ResearchState)
+    builder.add_node("prepare_question",prepare_question)
+    builder.add_node("decide_tool",make_decision_node(client))
+    builder.add_node("execute_tools",make_mcp_tool_node(mcp_client))
+    builder.add_node("generate_final_answer",make_final_answer_node(client))
+    
+    builder.add_edge(START, "prepare_question")
+    builder.add_edge("prepare_question","decide_tool")
+    builder.add_conditional_edges(
+        "decide_tool",
+        route_after_decision,
+        {
+            "search": "execute_tools",
+            "direct": END
+        }
+    )
+    builder.add_edge("execute_tools","generate_final_answer")
+    builder.add_edge("generate_final_answer",END)
     return builder.compile()
